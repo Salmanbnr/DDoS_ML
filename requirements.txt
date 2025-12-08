@@ -4,3 +4,10 @@ matplotlib
 seaborn
 scikit-learn
 joblib
+scapy
+flask
+flask-cors
+psutil
+plotly
+dash
+dash-bootstrap-components
