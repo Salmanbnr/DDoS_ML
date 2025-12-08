@@ -7,7 +7,7 @@ import threading
 import json
 
 class DDoSDetector:
-    """Real-time DDoS detection using trained ML model"""
+    """Real-time DDoS detection using trained ML model with custom thresholds"""
     
     def __init__(self, model_path='model/best_model.pkl', scaler_path='model/scaler.pkl'):
         print("Loading ML model and scaler...")
@@ -33,21 +33,14 @@ class DDoSDetector:
             'active_threats': []
         }
         
-        # Alert threshold
-        self.alert_threshold = 0.7  # 70% probability for alert
+        # Alert threshold updated to 80% as requested
+        self.alert_threshold = 0.8  
     
     def predict(self, features_df, flow_id, packet_info):
-        """Make prediction on network flow"""
+        """Make prediction on network flow using 80% threshold"""
         try:
-            # Ensure features are in correct order
             if features_df is None or features_df.empty:
                 return None
-            
-            # Debug: Print first prediction
-            if self.stats['total_predictions'] == 0:
-                print(f"\n[DEBUG] First prediction attempt:")
-                print(f"  - Features shape: {features_df.shape}")
-                print(f"  - Flow ID: {flow_id}")
             
             # Handle any remaining NaN or inf values
             features_df = features_df.replace([np.inf, -np.inf], 0)
@@ -56,42 +49,37 @@ class DDoSDetector:
             # Scale features
             features_scaled = self.scaler.transform(features_df)
             
-            # Make prediction
-            prediction = self.model.predict(features_scaled)[0]
+            # Get probabilities instead of raw labels
             probability = self.model.predict_proba(features_scaled)[0]
+            ddos_prob = float(probability[1])  # Probability of DDoS class 
             
-            # Debug: Print first few predictions
-            if self.stats['total_predictions'] < 5:
-                print(f"  - Prediction: {prediction} ({'DDoS' if prediction == 1 else 'Benign'})")
-                print(f"  - Probability: {probability[1]:.2%}")
+            # CUSTOM LOGIC: Classify as DDoS only if probability >= 80%
+            custom_prediction = 1 if ddos_prob >= self.alert_threshold else 0
             
             # Store detection result
             result = {
                 'timestamp': datetime.now().isoformat(),
                 'flow_id': flow_id,
-                'prediction': int(prediction),
-                'prediction_label': 'DDoS' if prediction == 1 else 'Benign',
-                'probability': float(probability[1]),  # Probability of DDoS
+                'prediction': custom_prediction,
+                'prediction_label': 'DDoS' if custom_prediction == 1 else 'Benign',
+                'probability': ddos_prob, 
                 'src_ip': packet_info.get('src_ip', 'Unknown'),
                 'dst_ip': packet_info.get('dst_ip', 'Unknown'),
-                'severity': self._calculate_severity(probability[1])
+                'severity': self._calculate_severity(ddos_prob)
             }
             
             with self.lock:
                 self.detections.append(result)
                 self.stats['total_predictions'] += 1
                 
-                if prediction == 1:
+                if custom_prediction == 1:
                     self.stats['ddos_count'] += 1
                     self.stats['last_detection'] = result
-                    
-                    # Add to active threats if high confidence
-                    if probability[1] >= self.alert_threshold:
-                        self._add_active_threat(result)
+                    self._add_active_threat(result)
                 else:
                     self.stats['benign_count'] += 1
                 
-                # Update detection rate
+                # Update detection rate based on custom classification
                 if self.stats['total_predictions'] > 0:
                     self.stats['detection_rate'] = (
                         self.stats['ddos_count'] / self.stats['total_predictions']
@@ -107,9 +95,9 @@ class DDoSDetector:
         """Calculate threat severity based on probability"""
         if probability < 0.3:
             return 'low'
-        elif probability < 0.7:
+        elif probability < 0.6:
             return 'medium'
-        elif probability < 0.9:
+        elif probability < 0.85:
             return 'high'
         else:
             return 'critical'
@@ -117,17 +105,13 @@ class DDoSDetector:
     def _add_active_threat(self, result):
         """Add or update active threat"""
         src_ip = result['src_ip']
-        
-        # Check if threat already exists
         threat_exists = False
+        
         for threat in self.stats['active_threats']:
             if threat['src_ip'] == src_ip:
                 threat['count'] += 1
                 threat['last_seen'] = result['timestamp']
-                threat['max_probability'] = max(
-                    threat['max_probability'], 
-                    result['probability']
-                )
+                threat['max_probability'] = max(threat['max_probability'], result['probability'])
                 threat_exists = True
                 break
         
@@ -143,32 +127,28 @@ class DDoSDetector:
                 'severity': result['severity']
             })
         
-        # Keep only recent threats (last 5 minutes)
+        # Keep recent threats (last 5 mins)
         self.stats['active_threats'] = [
             t for t in self.stats['active_threats']
             if (datetime.now() - datetime.fromisoformat(t['last_seen'])).total_seconds() < 300
         ]
     
     def get_recent_detections(self, n=20):
-        """Get recent detections"""
         with self.lock:
             return list(self.detections)[-n:]
     
     def get_stats(self):
-        """Get detection statistics"""
         with self.lock:
             return self.stats.copy()
     
     def get_active_threats(self):
-        """Get currently active threats"""
         with self.lock:
             return self.stats['active_threats'].copy()
     
     def get_timeline_data(self, minutes=10):
-        """Get detection timeline data for charts"""
+        """Get timeline data for charts"""
         with self.lock:
             cutoff_time = datetime.now().timestamp() - (minutes * 60)
-            
             timeline = []
             for detection in self.detections:
                 det_time = datetime.fromisoformat(detection['timestamp']).timestamp()
@@ -178,11 +158,9 @@ class DDoSDetector:
                         'type': detection['prediction_label'],
                         'probability': detection['probability']
                     })
-            
             return timeline
     
     def reset_stats(self):
-        """Reset statistics"""
         with self.lock:
             self.stats = {
                 'total_predictions': 0,
