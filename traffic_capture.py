@@ -76,9 +76,9 @@ class TrafficCapture:
                     }
                     self.recent_packets.append(packet_info)
 
-                    # Extract features if flow has enough packets
+                    # FIXED: Wait for MORE packets before classification (10 instead of 5)
                     flow = self.extractor.flows[flow_id]
-                    if len(flow['packets']) >= 3:  # Lowered from 5 to 3 for faster detection
+                    if len(flow['packets']) >= 10:  # Increased from 5 to 10 for better feature quality
                         features_df = self.extractor.extract_features(flow_id)
 
                         if features_df is not None and self.callback:

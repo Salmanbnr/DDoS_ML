@@ -12,9 +12,9 @@ class DDoSDetector:
     def __init__(self,
                  model_path='model/best_model.pkl',
                  scaler_path='model/scaler.pkl',
-                 alert_threshold=0.7,          # default lowered from 0.9 for practical detection
-                 smoothing_window=5,           # how many recent probabilities to average
-                 min_history_for_detection=2   # min items required before smoothing considered
+                 alert_threshold=0.85,          # INCREASED from 0.6 to reduce false positives
+                 smoothing_window=5,
+                 min_history_for_detection=3    # INCREASED from 2 to require more evidence
                  ):
         print("Loading ML model and scaler...")
         try:
@@ -97,22 +97,22 @@ class DDoSDetector:
                 self.prob_history_src[src_ip].append(ddos_prob)
                 self.prob_history_dst[dst_ip].append(ddos_prob)
 
-                # Moving average (prefer source-based smoothing; fallback to dst)
+                # FIXED: Use AVERAGE instead of MAX for smoothing
                 avg_src = float(np.mean(self.prob_history_src[src_ip])) if len(self.prob_history_src[src_ip]) >= self.min_history_for_detection else None
                 avg_dst = float(np.mean(self.prob_history_dst[dst_ip])) if len(self.prob_history_dst[dst_ip]) >= self.min_history_for_detection else None
 
-            # Decide final probability using available smoothed values
-            # Priority: avg_src (if available) -> avg_dst -> instantaneous prob
+            # FIXED: Use smoothed average, not max. If insufficient history, default to instant prob
             if avg_src is not None:
-                final_prob = max(ddos_prob, avg_src)
+                final_prob = avg_src  # Use average, not max
             elif avg_dst is not None:
-                final_prob = max(ddos_prob, avg_dst)
+                final_prob = avg_dst
             else:
-                final_prob = ddos_prob
+                # Not enough history - be conservative, don't classify yet
+                final_prob = ddos_prob * 0.5  # Reduce confidence for single observation
 
             final_prediction = 1 if final_prob >= self.alert_threshold else 0
 
-            print(f"Flow {flow_id}: instant_prob={ddos_prob:.3f}, smoothed_prob={final_prob:.3f}, final={final_prediction} ({'DDoS' if final_prediction else 'Benign'})")
+            print(f"Flow {flow_id}: instant={ddos_prob:.3f}, smoothed={final_prob:.3f}, pred={final_prediction} ({'DDoS' if final_prediction else 'Benign'})")
 
             # Build result
             result = {
@@ -148,14 +148,16 @@ class DDoSDetector:
 
         except Exception as e:
             print(f"Error in prediction: {e}")
+            import traceback
+            traceback.print_exc()
             return None
 
     def _calculate_severity(self, probability):
-        if probability < 0.3:
+        if probability < 0.5:
             return 'low'
-        elif probability < 0.6:
+        elif probability < 0.7:
             return 'medium'
-        elif probability < 0.85:
+        elif probability < 0.9:
             return 'high'
         else:
             return 'critical'

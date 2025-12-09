@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#attack_simulator.py
 """
 Local Traffic Simulator for DDoS Detection Projects
 --------------------------------------------------

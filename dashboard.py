@@ -1,3 +1,4 @@
+#dashboard.py
 import platform
 import os
 import dash
@@ -56,9 +57,9 @@ except Exception as e:
 detector = DDoSDetector(
     model_path='model/best_model.pkl',
     scaler_path='model/scaler.pkl',
-    alert_threshold=0.6,    # more sensitive for testing; raise to reduce false positives
-    smoothing_window=3,     # short smoothing (number of recent probs to average)
-    min_history_for_detection=1
+    alert_threshold=0.85,    # more sensitive for testing; raise to reduce false positives
+    smoothing_window=20,     # short smoothing (number of recent probs to average)
+    min_history_for_detection=10
 )
 
 # Colors & helpers (kept same as your UI)

@@ -1,3 +1,4 @@
+# packet_processor.py
 import pandas as pd
 import numpy as np
 from collections import defaultdict
@@ -16,7 +17,8 @@ class FlowFeatureExtractor:
             'start_time': None,
             'flags': defaultdict(int)
         })
-        # Added 'Fwd Header Length.1' to match model trained on Pandas dataframe
+
+        # Features used for model training
         self.feature_names = [
             'Destination Port', 'Flow Duration', 'Total Fwd Packets', 'Total Backward Packets',
             'Total Length of Fwd Packets', 'Total Length of Bwd Packets', 'Fwd Packet Length Max',
@@ -110,7 +112,7 @@ class FlowFeatureExtractor:
         if len(timestamps) < 2:
             return 0, 0, 0, 0, 0
         
-        iats = [(timestamps[i+1] - timestamps[i]).total_seconds() * 1000000  # microseconds
+        iats = [(timestamps[i+1] - timestamps[i]).total_seconds() * 1000000
                 for i in range(len(timestamps)-1)]
         
         if not iats:
@@ -141,6 +143,7 @@ class FlowFeatureExtractor:
         
         features = {}
         
+        # Basic flow features
         features['Destination Port'] = flow['dst_port']
         features['Flow Duration'] = duration * 1000000
         features['Total Fwd Packets'] = len(fwd_packets)
@@ -160,18 +163,19 @@ class FlowFeatureExtractor:
         features['Flow Bytes/s'] = total_bytes / duration if duration > 0 else 0
         features['Flow Packets/s'] = len(all_packets) / duration if duration > 0 else 0
         
+        # Inter-arrival times
         flow_iat = self.calculate_iat(flow['timestamps'])
         features['Flow IAT Mean'], features['Flow IAT Std'], features['Flow IAT Max'], features['Flow IAT Min'] = flow_iat[1], flow_iat[2], flow_iat[3], flow_iat[4]
         
-        fwd_timestamps = [flow['timestamps'][i] for i, pkt in enumerate(flow['packets']) if i < len(flow['fwd_packets'])]
+        fwd_timestamps = flow['timestamps'][:len(fwd_packets)]
         fwd_iat = self.calculate_iat(fwd_timestamps)
         features['Fwd IAT Total'], features['Fwd IAT Mean'], features['Fwd IAT Std'], features['Fwd IAT Max'], features['Fwd IAT Min'] = fwd_iat
         
-        bwd_timestamps = [flow['timestamps'][i] for i, pkt in enumerate(flow['packets']) if i >= len(flow['fwd_packets'])]
+        bwd_timestamps = flow['timestamps'][len(fwd_packets):]
         bwd_iat = self.calculate_iat(bwd_timestamps)
         features['Bwd IAT Total'], features['Bwd IAT Mean'], features['Bwd IAT Std'], features['Bwd IAT Max'], features['Bwd IAT Min'] = bwd_iat
         
-        features['Fwd PSH Flags'], features['Bwd PSH Flags'], features['Fwd URG Flags'], features['Bwd URG Flags'] = 0, 0, 0, 0
+        # Flags
         features['FIN Flag Count'] = flow['flags'].get('FIN', 0)
         features['SYN Flag Count'] = flow['flags'].get('SYN', 0)
         features['RST Flag Count'] = flow['flags'].get('RST', 0)
@@ -181,11 +185,13 @@ class FlowFeatureExtractor:
         features['CWE Flag Count'] = flow['flags'].get('CWR', 0)
         features['ECE Flag Count'] = flow['flags'].get('ECE', 0)
         
+        # Header lengths
         header_val = len(fwd_packets) * 40
         features['Fwd Header Length'] = header_val
-        features['Fwd Header Length.1'] = header_val  # Missing column duplicate fix
+        features['Fwd Header Length.1'] = header_val  # MUST EXIST for scaler
         features['Bwd Header Length'] = len(bwd_packets) * 40
         
+        # Rates and sizes
         features['Fwd Packets/s'] = len(fwd_packets) / duration if duration > 0 else 0
         features['Bwd Packets/s'] = len(bwd_packets) / duration if duration > 0 else 0
         features['Min Packet Length'] = min(all_packets) if all_packets else 0
@@ -199,10 +205,12 @@ class FlowFeatureExtractor:
         features['Avg Fwd Segment Size'] = np.mean(fwd_packets) if fwd_packets else 0
         features['Avg Bwd Segment Size'] = np.mean(bwd_packets) if bwd_packets else 0
         
-        # Simplified Bulk
-        for key in ['Fwd Avg Bytes/Bulk', 'Fwd Avg Packets/Bulk', 'Fwd Avg Bulk Rate', 'Bwd Avg Bytes/Bulk', 'Bwd Avg Packets/Bulk', 'Bwd Avg Bulk Rate']:
+        # Bulk placeholders
+        for key in ['Fwd Avg Bytes/Bulk', 'Fwd Avg Packets/Bulk', 'Fwd Avg Bulk Rate', 
+                    'Bwd Avg Bytes/Bulk', 'Bwd Avg Packets/Bulk', 'Bwd Avg Bulk Rate']:
             features[key] = 0
-            
+        
+        # Subflows
         features['Subflow Fwd Packets'], features['Subflow Fwd Bytes'] = len(fwd_packets), sum(fwd_packets)
         features['Subflow Bwd Packets'], features['Subflow Bwd Bytes'] = len(bwd_packets), sum(bwd_packets)
         features['Init_Win_bytes_forward'], features['Init_Win_bytes_backward'] = 65535, 65535
@@ -210,8 +218,11 @@ class FlowFeatureExtractor:
         features['min_seg_size_forward'] = min(fwd_packets) if fwd_packets else 0
         features['Active Mean'], features['Active Std'], features['Active Max'], features['Active Min'] = duration * 500000, 0, duration * 1000000, 0
         features['Idle Mean'], features['Idle Std'], features['Idle Max'], features['Idle Min'] = 0, 0, 0, 0
-        
-        return pd.DataFrame([features], columns=self.feature_names)
+
+        # Ensure all columns exist and in correct order for scaler
+        df = pd.DataFrame([features])
+        df = df.reindex(columns=self.feature_names, fill_value=0)
+        return df
     
     def cleanup_old_flows(self, timeout=30):
         """Remove flows older than timeout seconds"""
