@@ -1,0 +1,23 @@
+version: '3.8'
+
+services:
+  ddos-attacker:
+    build: .
+    image: ddos-attacker:latest
+    container_name: ddos-attacker
+    network_mode: "bridge"
+    environment:
+      - TARGET_IP=192.168.1.100  # CHANGE THIS to your IP
+      - TARGET_PORT=8050
+      - ATTACK_TYPE=http
+      - DURATION=120
+      - INTENSITY=medium
+    command: >
+      python3 docker_ddos_attacker.py
+      --target ${TARGET_IP:-192.168.1.100}
+      --port ${TARGET_PORT:-8050}
+      --type ${ATTACK_TYPE:-http}
+      --duration ${DURATION:-120}
+      --intensity ${INTENSITY:-medium}
+    stdin_open: true
+    tty: true

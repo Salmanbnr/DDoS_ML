@@ -1,3 +1,4 @@
+#ddos_detector.py
 import joblib
 import pandas as pd
 import numpy as np
@@ -7,22 +8,23 @@ import threading
 
 
 class DDoSDetector:
-    """Real-time DDoS detection using ONLY the trained ML model with temporal smoothing of model probabilities."""
+    """Real-time DDoS detection using trained ML model - FIXED VERSION"""
 
     def __init__(self,
                  model_path='model/best_model.pkl',
                  scaler_path='model/scaler.pkl',
-                 alert_threshold=0.85,          # INCREASED from 0.6 to reduce false positives
-                 smoothing_window=5,
-                 min_history_for_detection=3    # INCREASED from 2 to require more evidence
+                 alert_threshold=0.65,          # **REDUCED** from 0.85 to 0.65 for better detection
+                 smoothing_window=2,            # **REDUCED** from 3 to 2
+                 min_history_for_detection=1    # **REDUCED** from 2 to 1 for faster response
                  ):
         print("Loading ML model and scaler...")
         try:
             self.model = joblib.load(model_path)
             self.scaler = joblib.load(scaler_path)
-            print("Model and scaler loaded successfully")
+            print("✓ Model and scaler loaded successfully")
+            print(f"✓ Alert threshold set to: {alert_threshold}")
         except Exception as e:
-            print(f"Error loading model or scaler: {e}")
+            print(f"❌ Error loading model or scaler: {e}")
             raise
 
         # Detection history (store results)
@@ -44,16 +46,15 @@ class DDoSDetector:
         self.smoothing_window = max(1, smoothing_window)
         self.min_history_for_detection = max(1, min_history_for_detection)
 
-        # Keep per-source and per-destination recent probability history (deques)
+        # Keep per-source and per-destination recent probability history
         self.prob_history_src = defaultdict(lambda: deque(maxlen=self.smoothing_window))
         self.prob_history_dst = defaultdict(lambda: deque(maxlen=self.smoothing_window))
 
     def _safe_dataframe(self, features_df):
-        """Ensure numeric and no inf/nans (used before scaling)."""
+        """Ensure numeric and no inf/nans"""
         df = features_df.copy()
         df = df.replace([np.inf, -np.inf], 0)
         df = df.fillna(0)
-        # Ensure dtypes are numeric
         for c in df.columns:
             if not np.issubdtype(df[c].dtype, np.number):
                 try:
@@ -63,28 +64,25 @@ class DDoSDetector:
         return df
 
     def predict(self, features_df, flow_id, packet_info):
-        """
-        Make ML-only prediction. Uses moving average of recent probabilities per-src and per-dst
-        to reduce noise on short flows (still ML-only).
-        """
+        """Make ML prediction with improved detection"""
         try:
             if features_df is None or features_df.empty:
                 return None
 
             df_clean = self._safe_dataframe(features_df)
 
-            # Scale features; protect against scaler errors
+            # Scale features
             try:
                 features_scaled = self.scaler.transform(df_clean)
             except Exception as e:
-                print(f"Scaler transform error: {e}. Returning None.")
+                print(f"⚠ Scaler transform error: {e}")
                 return None
 
             # Get ML model probabilities
             try:
                 probs = self.model.predict_proba(features_scaled)[0]
             except Exception as e:
-                print(f"Model predict_proba error: {e}. Returning None.")
+                print(f"⚠ Model predict_proba error: {e}")
                 return None
 
             ddos_prob = float(probs[1])  # Probability for DDoS class
@@ -97,22 +95,34 @@ class DDoSDetector:
                 self.prob_history_src[src_ip].append(ddos_prob)
                 self.prob_history_dst[dst_ip].append(ddos_prob)
 
-                # FIXED: Use AVERAGE instead of MAX for smoothing
-                avg_src = float(np.mean(self.prob_history_src[src_ip])) if len(self.prob_history_src[src_ip]) >= self.min_history_for_detection else None
-                avg_dst = float(np.mean(self.prob_history_dst[dst_ip])) if len(self.prob_history_dst[dst_ip]) >= self.min_history_for_detection else None
+                # **FIXED**: Use average for smoothing, with fallback
+                if len(self.prob_history_src[src_ip]) >= self.min_history_for_detection:
+                    avg_src = float(np.mean(self.prob_history_src[src_ip]))
+                else:
+                    avg_src = None
 
-            # FIXED: Use smoothed average, not max. If insufficient history, default to instant prob
-            if avg_src is not None:
-                final_prob = avg_src  # Use average, not max
+                if len(self.prob_history_dst[dst_ip]) >= self.min_history_for_detection:
+                    avg_dst = float(np.mean(self.prob_history_dst[dst_ip]))
+                else:
+                    avg_dst = None
+
+            # **FIXED**: Better probability calculation
+            if avg_src is not None and avg_dst is not None:
+                # If we have both, use the maximum (more aggressive)
+                final_prob = max(avg_src, avg_dst)
+            elif avg_src is not None:
+                final_prob = avg_src
             elif avg_dst is not None:
                 final_prob = avg_dst
             else:
-                # Not enough history - be conservative, don't classify yet
-                final_prob = ddos_prob * 0.5  # Reduce confidence for single observation
+                # Not enough history - use instant probability with slight penalty
+                final_prob = ddos_prob * 0.9  # Only 10% penalty instead of 50%
 
             final_prediction = 1 if final_prob >= self.alert_threshold else 0
 
-            print(f"Flow {flow_id}: instant={ddos_prob:.3f}, smoothed={final_prob:.3f}, pred={final_prediction} ({'DDoS' if final_prediction else 'Benign'})")
+            # **IMPROVED**: Better logging with emojis
+            status_emoji = "🚨" if final_prediction == 1 else "✅"
+            print(f"{status_emoji} Flow {flow_id[:20]}... | instant={ddos_prob:.3f} | smoothed={final_prob:.3f} | {'⚠️ DDoS DETECTED' if final_prediction else 'Benign'}")
 
             # Build result
             result = {
@@ -138,6 +148,15 @@ class DDoSDetector:
                     self.stats['ddos_count'] += 1
                     self.stats['last_detection'] = result
                     self._add_active_threat(result)
+                    
+                    # **NEW**: Alert on detection
+                    print(f"\n{'='*60}")
+                    print(f"🚨 DDoS ATTACK DETECTED!")
+                    print(f"   Source: {src_ip}")
+                    print(f"   Destination: {dst_ip}:{packet_info.get('dst_port', 0)}")
+                    print(f"   Confidence: {final_prob:.1%}")
+                    print(f"   Severity: {result['severity'].upper()}")
+                    print(f"{'='*60}\n")
                 else:
                     self.stats['benign_count'] += 1
 
@@ -147,7 +166,7 @@ class DDoSDetector:
             return result
 
         except Exception as e:
-            print(f"Error in prediction: {e}")
+            print(f"❌ Error in prediction: {e}")
             import traceback
             traceback.print_exc()
             return None
@@ -157,7 +176,7 @@ class DDoSDetector:
             return 'low'
         elif probability < 0.7:
             return 'medium'
-        elif probability < 0.9:
+        elif probability < 0.85:
             return 'high'
         else:
             return 'critical'
@@ -193,7 +212,7 @@ class DDoSDetector:
             if (datetime.now() - datetime.fromisoformat(t['last_seen'])).total_seconds() < cutoff_seconds
         ]
 
-    # ----- helpers to expose info -----
+    # ----- Helper methods -----
     def get_recent_detections(self, n=20):
         with self.lock:
             return list(self.detections)[-n:]
@@ -233,3 +252,4 @@ class DDoSDetector:
             self.detections.clear()
             self.prob_history_src.clear()
             self.prob_history_dst.clear()
+            print("✓ Statistics reset")

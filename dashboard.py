@@ -58,8 +58,8 @@ detector = DDoSDetector(
     model_path='model/best_model.pkl',
     scaler_path='model/scaler.pkl',
     alert_threshold=0.85,    # more sensitive for testing; raise to reduce false positives
-    smoothing_window=20,     # short smoothing (number of recent probs to average)
-    min_history_for_detection=10
+    smoothing_window=3,     # short smoothing (number of recent probs to average)
+    min_history_for_detection=2
 )
 
 # Colors & helpers (kept same as your UI)
@@ -346,4 +346,4 @@ def update_packets_table(n):
 # Run server
 if __name__ == '__main__':
     print("Starting Dashboard on http://127.0.0.1:8050")
-    app.run(debug=False, host='127.0.0.1', port=8050)
+    app.run(debug=False, host='0.0.0.0', port=8050)
