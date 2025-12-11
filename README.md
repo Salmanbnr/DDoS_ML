@@ -88,10 +88,10 @@ Working with these features strengthened my understanding of how **low-level pac
 
 ```
 
-┌────────────────────────────┐
-│     Docker Attack Box      │
+┌────────────────────────────-┐
+│     Docker Attack Box       │
 │  (HTTP, SYN, UDP, Slowloris)│
-└──────────────┬─────────────┘
+└──────────────┬─────────────-┘
 │
 ▼
 ┌────────────────────────────────────┐
@@ -163,7 +163,7 @@ docker run --rm -it ddos-attacker python3 docker_ddos_attacker.py \
     --duration 120 \
     --intensity medium
 ```
-## **Run an Attack way 2**
+#### **Run an Attack way 2**
 
 The another way to run attack is to run
 
