@@ -197,7 +197,7 @@ def update_stats(n):
     ddos_count = stats['ddos_count']
     
     # Logic for overall alert status
-    alert_rate_threshold_high = 0.5 
+    alert_rate_threshold_high = 0.3 
     alert_rate_threshold_elevated = 0.1
 
     timeline_data = detector.get_timeline_data()

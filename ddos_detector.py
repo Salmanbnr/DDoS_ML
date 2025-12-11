@@ -12,7 +12,7 @@ from flow_extractor import FlowExtractor
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 class DDoSDetector:
-    def __init__(self, model_path='model/best_model.pkl', scaler_path='model/scaler.pkl', alert_threshold=0.5):  # Lowered threshold to 0.5
+    def __init__(self, model_path='model/best_model.pkl', scaler_path='model/scaler.pkl', alert_threshold=0.7):  # Adjusted threshold to 0.7 for higher confidence
         self.model = None
         self.scaler = None
         self.alert_threshold = alert_threshold
@@ -64,9 +64,7 @@ class DDoSDetector:
         """Scales input features and uses the loaded model to predict the class."""
         with self.lock:
             try:
-                # Added logging: Print key features for debugging
-                logging.info(f"Features for flow {flow_id}: Destination Port={features_df.get(' Destination Port', 'N/A')}, Flow Duration={features_df.get(' Flow Duration', 'N/A')}, Total Fwd Packets={features_df.get(' Total Fwd Packets', 'N/A')}, Total Backward Packets={features_df.get(' Total Backward Packets', 'N/A')}, Fwd Packet Length Mean={features_df.get(' Fwd Packet Length Mean', 'N/A')}, Flow Bytes/s={features_df.get(' Flow Bytes/s', 'N/A')}, Flow Packets/s={features_df.get(' Flow Packets/s', 'N/A')}")
-
+                
                 # 1. Prepare data for model: ensure float64 and check non-finite values
                 
                 # Check for infinite/NaN values using the DataFrame's underlying NumPy array
@@ -75,30 +73,32 @@ class DDoSDetector:
                      return {'is_ddos': False, 'confidence': 0.0, 'flow_id': flow_id, 'reason': 'Non-finite features'}
 
                 # FIX FOR WARNING: Pass the DataFrame directly to the scaler. 
-                # The scaler recognizes the feature names, suppressing the warning.
                 X_scaled = self.scaler.transform(features_df.astype(np.float64))
                 
-                # 2. Get prediction (0=Benign, 1=DDoS)
-                prediction = self.model.predict(X_scaled)[0]
+                # 2. Get model prediction class (0=Benign, 1=DDoS) - for reference only
+                model_class = self.model.predict(X_scaled)[0]
                 
                 # 3. Get confidence (probability of DDoS)
                 if hasattr(self.model, 'predict_proba'):
                     # The model expects X_scaled to be an array, which it is.
                     confidence = self.model.predict_proba(X_scaled)[0][1] 
                 else:
-                    confidence = 1.0 if prediction == 1 else 0.0
+                    confidence = 1.0 if model_class == 1 else 0.0
 
-                is_ddos = (prediction == 1) or (confidence >= self.alert_threshold)
+                # 4. Determine is_ddos based solely on confidence threshold
+                # This allows tuning the sensitivity without relying on the model's internal threshold (usually 0.5)
+                # If confidence >= alert_threshold, flag as DDoS. This is more flexible for false positive/negative control.
+                is_ddos = confidence >= self.alert_threshold
 
                 # Added logging: Always log prediction result
-                logging.info(f"Prediction for flow {flow_id}: is_ddos={is_ddos}, prediction_class={prediction}, confidence (prob DDoS)={confidence:.4f}")
+                logging.info(f"Prediction for flow {flow_id}: is_ddos={is_ddos}, model_class={model_class}, confidence (prob DDoS)={confidence:.4f}")
 
-                # 4. Update stats (Lock is held by this function)
+                # 5. Update stats (Lock is held by this function)
                 self._update_stats(is_ddos, confidence, flow_id, packet_info)
                 
                 return {
                     'is_ddos': is_ddos,
-                    'prediction': int(prediction),
+                    'model_class': int(model_class),  # Renamed from 'prediction' to clarify it's the model's raw class
                     'confidence': float(confidence),
                     'flow_id': flow_id,
                     'timestamp': datetime.now().isoformat()

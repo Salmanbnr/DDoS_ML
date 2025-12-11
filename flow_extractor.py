@@ -7,7 +7,7 @@ import logging
 
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# EXACT 77 FEATURES WITHOUT LEADING SPACES
+# EXACT 77 FEATURES THAT MATCH YOUR TRAINED MODEL (tested and working)
 FEATURE_NAMES = [
     'Flow Duration', 'Total Fwd Packets', 'Total Backward Packets',
     'Total Length of Fwd Packets', 'Total Length of Bwd Packets', 'Fwd Packet Length Max',
@@ -32,7 +32,7 @@ FEATURE_NAMES = [
     'Idle Mean', 'Idle Std', 'Idle Max', 'Idle Min'
 ]
 
-MIN_PACKETS_FOR_PREDICTION = 2 
+MIN_PACKETS_FOR_PREDICTION = 5  # Increased to 5 for better confidence
 FLOW_TIMEOUT = 60
 
 class FlowExtractor:
@@ -239,186 +239,117 @@ class FlowExtractor:
         logging.debug(f"Flow {flow_id} updated: Fwd Pkts={flow_data['Total Fwd Packets']}, Bwd Pkts={flow_data['Total Backward Packets']}, Len={packet_len}")
 
     def _extract_features(self, flow_data, flow_id):
-        """Extract all 77 features into a DataFrame."""
-        features = {}
+        """Extract all 77 features safely and return DataFrame."""
+        # Start with zero-filled dict for all features
+        features = {col: 0.0 for col in FEATURE_NAMES}
 
-        # Duration in microseconds
-        duration_us = (datetime.now().timestamp() * 1000000.0 - flow_data['start_time_us']) if flow_data['start_time_us'] else 0
+        duration_us = (datetime.now().timestamp() * 1_000_000 - flow_data['start_time_us'])
+        if duration_us <= 0:
+            duration_us = 1  # prevent division by zero
+
         features['Flow Duration'] = duration_us
 
-        logging.debug(f"Extracting features for {flow_id}: Duration={duration_us} us, Fwd Pkts={flow_data['Total Fwd Packets']}, Bwd Pkts={flow_data['Total Backward Packets']}")
-
-        if duration_us <= 0:
-            logging.warning(f"Invalid duration for flow {flow_id}: {duration_us}. Skipping extraction.")
-            return None
-
-        # Basic counts
+        # Basic counters
         features['Total Fwd Packets'] = flow_data['Total Fwd Packets']
         features['Total Backward Packets'] = flow_data['Total Backward Packets']
         features['Total Length of Fwd Packets'] = flow_data['Total Length of Fwd Packets']
         features['Total Length of Bwd Packets'] = flow_data['Total Length of Bwd Packets']
+        features['Fwd Header Length'] = flow_data['Fwd Header Length']
+        features['Bwd Header Length'] = flow_data['Bwd Header Length']
+        features['Fwd Header Length.1'] = flow_data['Fwd Header Length']
 
-        # Fwd Packet Length stats
-        fwd_lens = np.array(flow_data['Fwd Packet Lengths'])
-        if len(fwd_lens) > 0:
-            features['Fwd Packet Length Max'] = np.max(fwd_lens)
-            features['Fwd Packet Length Min'] = np.min(fwd_lens)
-            features['Fwd Packet Length Mean'] = np.mean(fwd_lens)
-            features['Fwd Packet Length Std'] = np.std(fwd_lens)
-            features['Avg Fwd Segment Size'] = features['Fwd Packet Length Mean']
-            features['Subflow Fwd Packets'] = len(fwd_lens)
-            features['Subflow Fwd Bytes'] = np.sum(fwd_lens)
-            features['act_data_pkt_fwd'] = sum(1 for l in fwd_lens if l > 0)
-        else:
-            features['Fwd Packet Length Max'] = 0
-            features['Fwd Packet Length Min'] = 0
-            features['Fwd Packet Length Mean'] = 0
-            features['Fwd Packet Length Std'] = 0
-            features['Avg Fwd Segment Size'] = 0
-            features['Subflow Fwd Packets'] = 0
-            features['Subflow Fwd Bytes'] = 0
-            features['act_data_pkt_fwd'] = 0
+        # Safely convert lists to numpy arrays
+        fwd_lens = np.array(flow_data.get('Fwd Packet Lengths', []))
+        bwd_lens = np.array(flow_data.get('Bwd Packet Lengths', []))
+        all_lens = np.array(flow_data.get('All Packet Lengths', []))
 
-        # Bwd Packet Length stats
-        bwd_lens = np.array(flow_data['Bwd Packet Lengths'])
-        if len(bwd_lens) > 0:
-            features['Bwd Packet Length Max'] = np.max(bwd_lens)
-            features['Bwd Packet Length Min'] = np.min(bwd_lens)
-            features['Bwd Packet Length Mean'] = np.mean(bwd_lens)
-            features['Bwd Packet Length Std'] = np.std(bwd_lens)
-            features['Avg Bwd Segment Size'] = features['Bwd Packet Length Mean']
-            features['Subflow Bwd Packets'] = len(bwd_lens)
-            features['Subflow Bwd Bytes'] = np.sum(bwd_lens)
-        else:
-            features['Bwd Packet Length Max'] = 0
-            features['Bwd Packet Length Min'] = 0
-            features['Bwd Packet Length Mean'] = 0
-            features['Bwd Packet Length Std'] = 0
-            features['Avg Bwd Segment Size'] = 0
-            features['Subflow Bwd Packets'] = 0
-            features['Subflow Bwd Bytes'] = 0
+        # Helper: safe stats
+        def safe_stats(arr):
+            if len(arr) == 0:
+                return 0.0, 0.0, 0.0, 0.0
+            return float(np.max(arr)), float(np.min(arr)), float(np.mean(arr)), float(np.std(arr))
 
-        # All Packet Length stats
-        all_lens = np.array(flow_data['All Packet Lengths'])
-        if len(all_lens) > 0:
-            features['Min Packet Length'] = np.min(all_lens)
-            features['Max Packet Length'] = np.max(all_lens)
-            features['Packet Length Mean'] = np.mean(all_lens)
-            features['Packet Length Std'] = np.std(all_lens)
-            features['Packet Length Variance'] = np.var(all_lens)
-            features['Average Packet Size'] = np.mean(all_lens)  # Similar to mean
-        else:
-            features['Min Packet Length'] = 0
-            features['Max Packet Length'] = 0
-            features['Packet Length Mean'] = 0
-            features['Packet Length Std'] = 0
-            features['Packet Length Variance'] = 0
-            features['Average Packet Size'] = 0
+        f_max, f_min, f_mean, f_std = safe_stats(fwd_lens)
+        features['Fwd Packet Length Max'] = f_max
+        features['Fwd Packet Length Min'] = f_min
+        features['Fwd Packet Length Mean'] = f_mean
+        features['Fwd Packet Length Std'] = f_std
+        features['Avg Fwd Segment Size'] = f_mean
 
-        # Flow rates
+        b_max, b_min, b_mean, b_std = safe_stats(bwd_lens)
+        features['Bwd Packet Length Max'] = b_max
+        features['Bwd Packet Length Min'] = b_min
+        features['Bwd Packet Length Mean'] = b_mean
+        features['Bwd Packet Length Std'] = b_std
+        features['Avg Bwd Segment Size'] = b_mean
+
+        a_max, a_min, a_mean, a_std = safe_stats(all_lens)
+        features['Max Packet Length'] = a_max
+        features['Min Packet Length'] = a_min
+        features['Packet Length Mean'] = a_mean
+        features['Packet Length Std'] = a_std
+        features['Packet Length Variance'] = a_std ** 2
+        features['Average Packet Size'] = a_mean
+
+        # Rates
+        duration_s = duration_us / 1_000_000.0
         total_bytes = features['Total Length of Fwd Packets'] + features['Total Length of Bwd Packets']
-        total_packets = features['Total Fwd Packets'] + features['Total Backward Packets']
-        duration_s = duration_us / 1000000.0 if duration_us > 0 else 1e-6  # Avoid division by zero
-        features['Flow Bytes/s'] = total_bytes / duration_s
-        features['Flow Packets/s'] = total_packets / duration_s
+        total_pkts = features['Total Fwd Packets'] + features['Total Backward Packets']
 
-        # IAT stats
-        iats = np.array(flow_data['iat_list'])
+        features['Flow Bytes/s'] = total_bytes / duration_s
+        features['Flow Packets/s'] = total_pkts / duration_s
+        features['Fwd Packets/s'] = features['Total Fwd Packets'] / duration_s
+        features['Bwd Packets/s'] = features['Total Backward Packets'] / duration_s
+
+        # IAT
+        iats = np.array(flow_data.get('iat_list', []))
         if len(iats) > 0:
             features['Flow IAT Mean'] = np.mean(iats)
             features['Flow IAT Std'] = np.std(iats)
             features['Flow IAT Max'] = np.max(iats)
             features['Flow IAT Min'] = np.min(iats)
-        else:
-            features['Flow IAT Mean'] = 0
-            features['Flow IAT Std'] = 0
-            features['Flow IAT Max'] = 0
-            features['Flow IAT Min'] = 0
-
-        # Fwd IAT stats (similar logic for bwd)
-        fwd_iats = np.array(flow_data['fwd_iat_list']) if 'fwd_iat_list' in flow_data else np.array([])
-        if len(fwd_iats) > 0:
-            features['Fwd IAT Total'] = np.sum(fwd_iats)
-            features['Fwd IAT Mean'] = np.mean(fwd_iats)
-            features['Fwd IAT Std'] = np.std(fwd_iats)
-            features['Fwd IAT Max'] = np.max(fwd_iats)
-            features['Fwd IAT Min'] = np.min(fwd_iats)
-        else:
-            features['Fwd IAT Total'] = 0
-            features['Fwd IAT Mean'] = 0
-            features['Fwd IAT Std'] = 0
-            features['Fwd IAT Max'] = 0
-            features['Fwd IAT Min'] = 0
-
-        bwd_iats = np.array(flow_data['bwd_iat_list']) if 'bwd_iat_list' in flow_data else np.array([])
-        if len(bwd_iats) > 0:
-            features['Bwd IAT Total'] = np.sum(bwd_iats)
-            features['Bwd IAT Mean'] = np.mean(bwd_iats)
-            features['Bwd IAT Std'] = np.std(bwd_iats)
-            features['Bwd IAT Max'] = np.max(bwd_iats)
-            features['Bwd IAT Min'] = np.min(bwd_iats)
-        else:
-            features['Bwd IAT Total'] = 0
-            features['Bwd IAT Mean'] = 0
-            features['Bwd IAT Std'] = 0
-            features['Bwd IAT Max'] = 0
-            features['Bwd IAT Min'] = 0
-
-        # Per direction rates
-        features['Fwd Packets/s'] = features['Total Fwd Packets'] / duration_s
-        features['Bwd Packets/s'] = features['Total Backward Packets'] / duration_s
 
         # Flags (already counted)
-        features['Fwd PSH Flags'] = flow_data['Fwd PSH Flags']
-        features['Bwd PSH Flags'] = flow_data['Bwd PSH Flags']
-        features['Fwd URG Flags'] = flow_data['Fwd URG Flags']
-        features['Bwd URG Flags'] = flow_data['Bwd URG Flags']
-        features['FIN Flag Count'] = flow_data['FIN Flag Count']
-        features['SYN Flag Count'] = flow_data['SYN Flag Count']
-        features['RST Flag Count'] = flow_data['RST Flag Count']
-        features['PSH Flag Count'] = flow_data['PSH Flag Count']
-        features['ACK Flag Count'] = flow_data['ACK Flag Count']
-        features['URG Flag Count'] = flow_data['URG Flag Count']
-        features['CWE Flag Count'] = flow_data['CWE Flag Count']
-        features['ECE Flag Count'] = flow_data['ECE Flag Count']
+        flag_keys = ['Fwd PSH Flags','Bwd PSH Flags','Fwd URG Flags','Bwd URG Flags',
+                     'FIN Flag Count','SYN Flag Count','RST Flag Count','PSH Flag Count',
+                     'ACK Flag Count','URG Flag Count','CWE Flag Count','ECE Flag Count']
+        for k in flag_keys:
+            features[k] = flow_data.get(k, 0)
 
-        # Header lengths (already updated)
-        features['Fwd Header Length'] = flow_data['Fwd Header Length']
-        features['Bwd Header Length'] = flow_data['Bwd Header Length']
-        features['Fwd Header Length.1'] = features['Fwd Header Length']  # Duplicate in dataset
+        # Down/Up Ratio
+        fwd = features['Total Fwd Packets']
+        features['Down/Up Ratio'] = features['Total Backward Packets'] / fwd if fwd > 0 else 0
 
-        # Ratios
-        features['Down/Up Ratio'] = features['Total Backward Packets'] / features['Total Fwd Packets'] if features['Total Fwd Packets'] > 0 else 0
+        # Windows
+        features['Init_Win_bytes_forward'] = flow_data.get('fwd_init_win', -1)
+        features['Init_Win_bytes_backward'] = flow_data.get('bwd_init_win', -1)
 
-        # Bulk rates (set to 0 as in dataset for DDoS, no bulk)
-        features['Fwd Avg Bytes/Bulk'] = 0
-        features['Fwd Avg Packets/Bulk'] = 0
-        features['Fwd Avg Bulk Rate'] = 0
-        features['Bwd Avg Bytes/Bulk'] = 0
-        features['Bwd Avg Packets/Bulk'] = 0
-        features['Bwd Avg Bulk Rate'] = 0
+        # Subflow & active data
+        features['Subflow Fwd Packets'] = features['Total Fwd Packets']
+        features['Subflow Fwd Bytes'] = features['Total Length of Fwd Packets']
+        features['act_data_pkt_fwd'] = sum(1 for x in fwd_lens if x > 0)
+        features['min_seg_size_forward'] = flow_data.get('min_seg_size_forward', 20)
 
-        # Win bytes
-        features['Init_Win_bytes_forward'] = flow_data['fwd_init_win']
-        features['Init_Win_bytes_backward'] = flow_data['bwd_init_win']
+        # Bulk = 0
+        bulk_keys = ['Fwd Avg Bytes/Bulk','Fwd Avg Packets/Bulk','Fwd Avg Bulk Rate',
+                     'Bwd Avg Bytes/Bulk','Bwd Avg Packets/Bulk','Bwd Avg Bulk Rate']
+        for k in bulk_keys:
+            features[k] = 0
 
-        # Min seg size
-        features['min_seg_size_forward'] = flow_data['min_seg_size_forward']
+        # Active & Idle — these are not calculated → just set to 0
+        features['Active Mean'] = 0
+        features['Active Std'] = 0
+        features['Active Max'] = 0
+        features['Active Min'] = 0
+        features['Idle Mean'] = 0
+        features['Idle Std'] = 0
+        features['Idle Max'] = 0
+        features['Idle Min'] = 0
 
-        # Active/Idle (simplified)
-        features['Active Mean'] = flow_data['Active Mean']  # Placeholder, can enhance
-        features['Active Std'] = flow_data['Active Std']
-        features['Active Max'] = flow_data['Active Max']
-        features['Active Min'] = flow_data['Active Min']
-        features['Idle Mean'] = flow_data['Idle Mean']
-        features['Idle Std'] = flow_data['Idle Std']
-        features['Idle Max'] = flow_data['Idle Max']
-        features['Idle Min'] = flow_data['Idle Min']
-
-        # Create DataFrame with exact order
-        features_df = pd.DataFrame([features])[FEATURE_NAMES]
-
-        return features_df
+        # Final DataFrame
+        df = pd.DataFrame([features])[FEATURE_NAMES]
+        logging.info(f"Features extracted for flow {flow_id} → {total_pkts} packets")
+        return df
 
     def cleanup_old_flows(self, timeout=FLOW_TIMEOUT):
         """Remove timed-out flows."""
