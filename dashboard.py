@@ -1,349 +1,333 @@
-#dashboard.py
 import platform
 import os
 import dash
-from dash import dcc, html, Input, Output, State
+from dash import dcc, html, Input, Output
 import dash_bootstrap_components as dbc
 import plotly.graph_objs as go
-from datetime import datetime, timedelta
+from datetime import datetime
 import threading
 import time
 import traceback
+import logging
 
-# --- Delay importing heavy capture/detector until after we choose interface ---
+# --- CRITICAL IMPORTS ---
+# Ensure these imports are successful
 try:
-    # Try to import detector first (so errors are obvious)
+    # Assuming ddos_detector.py is in the same directory and is functional
     from ddos_detector import DDoSDetector
-except Exception as e:
-    print("Error importing ddos_detector. Make sure ddos_detector.py exists and is valid.")
-    raise
+    # Import sniff and IP from scapy for packet capture
+    from scapy.all import sniff, IP 
+except ImportError as e:
+    logging.critical(f"CRITICAL ERROR: Failed to import required modules. Detail: {e}")
+    # Set to None if imports fail to prevent later crashes
+    DDoSDetector = None
+    sniff = None
 
-# Determine interface heuristically (Windows friendly)
-# If you want to force an interface, replace None with the string shown by find_interface.py
-# e.g. INTERFACE = r'\Device\NPF_{DFC698EF-2612-46C7-BF80-ACBA4C9EE6B3}'
+
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')  # Set to DEBUG for detailed logs
+
+# --- CONFIGURATION ---
+# FORCE to None to capture on ALL interfaces (critical for Windows/Docker)
 INTERFACE = None
-
-if platform.system() == "Windows":
-    # Prefer the named loopback device if available
-    # Common Npcap loopback name: '\\Device\\NPF_Loopback' (or r'\Device\NPF_Loopback')
-    try_names = [r'\Device\NPF_Loopback', r'\\Device\\NPF_Loopback']
-    # You may override by setting environment variable INTERFACE
-    env_if = os.getenv("DDOS_IF")
-    if env_if:
-        INTERFACE = env_if
-    else:
-        # Try the loopback names, otherwise leave None to capture all interfaces (works on many Windows setups)
-        INTERFACE = None
-        for n in try_names:
-            try:
-                # We don't test sniff here; just prefer the name
-                INTERFACE = n
-                break
-            except:
-                INTERFACE = None
-
-# Now import TrafficCapture (after interface selection to avoid early circulars)
-try:
-    from traffic_capture import TrafficCapture
-except Exception as e:
-    print("Error importing TrafficCapture from traffic_capture.py.")
-    print("Make sure traffic_capture.py doesn't accidentally import dashboard or itself.")
-    print("Traceback:")
-    traceback.print_exc()
-    raise
-
-# --- Initialize the detector with practical defaults for local testing ---
-# Lower threshold and small smoothing window tend to work better for short local simulated flows.
-detector = DDoSDetector(
-    model_path='model/best_model.pkl',
-    scaler_path='model/scaler.pkl',
-    alert_threshold=0.85,    # more sensitive for testing; raise to reduce false positives
-    smoothing_window=3,     # short smoothing (number of recent probs to average)
-    min_history_for_detection=2
-)
-
-# Colors & helpers (kept same as your UI)
-COLORS = {
-    'background': '#0a0e27',
-    'card_bg': '#1a1f3a',
-    'text': '#ffffff',
-    'accent': '#00d9ff',
-    'danger': '#ff4444',
-    'warning': '#ffaa00',
-    'success': '#00ff88',
-    'benign': '#00ff88',
-    'ddos': '#ff4444'
-}
-
-def create_stat_card(title, card_id, icon, color):
-    return dbc.Card([
-        dbc.CardBody([
-            html.Div([
-                html.I(className=f"{icon} fa-2x mb-2", style={'color': color}),
-                html.H4(title, className='text-muted mb-2'),
-                html.H2(id=card_id, children='0', style={'color': color, 'fontWeight': 'bold'})
-            ], style={'textAlign': 'center'})
-        ])
-    ], style={'backgroundColor': COLORS['card_bg'], 'border': f'1px solid {color}'})
-
-def create_graph_card(title, graph_id):
-    return dbc.Card([
-        dbc.CardHeader(html.H5(title, style={'color': COLORS['text']})),
-        dbc.CardBody([
-            dcc.Graph(id=graph_id, style={'height': '300px'})
-        ])
-    ], style={'backgroundColor': COLORS['card_bg'], 'border': f'1px solid {COLORS["accent"]}'})
-
-def create_table_card(title, table_id):
-    return dbc.Card([
-        dbc.CardHeader(html.H5(title, style={'color': COLORS['text']})),
-        dbc.CardBody([
-            html.Div(id=table_id, style={'maxHeight': '300px', 'overflowY': 'auto'})
-        ])
-    ], style={'backgroundColor': COLORS['card_bg'], 'border': f'1px solid {COLORS["accent"]}'})
-
-def create_empty_figure(message):
-    fig = go.Figure()
-    fig.add_annotation(text=message, xref="paper", yref="paper", x=0.5, y=0.5, showarrow=False,
-                       font=dict(size=16, color=COLORS['text']))
-    fig.update_layout(template='plotly_dark', paper_bgcolor=COLORS['card_bg'],
-                      plot_bgcolor=COLORS['card_bg'],
-                      xaxis=dict(visible=False), yaxis=dict(visible=False),
-                      margin=dict(l=40, r=40, t=40, b=40))
-    return fig
-
-# --- Detection callback: send feature DF to detector and log result ---
-def detection_callback(features_df, flow_id, packet_info):
+logging.info("INTERFACE forced to None - capturing on all available interfaces to ensure Docker traffic is seen.")
+    
+# Global detector instance
+detector = None
+capture_thread = None
+capture_status = "Not Running"
+MIN_PACKETS_FOR_PREDICTION = 2
+if DDoSDetector:
     try:
-        result = detector.predict(features_df, flow_id, packet_info)
-        if result:
-            # Print diagnostics so you can see probabilities in terminal
-            inst = result.get('instant_probability', None)
-            prob = result.get('probability', result.get('instant_probability'))
-            label = result.get('prediction_label', 'Unknown')
-            src = result.get('src_ip')
-            dst = result.get('dst_ip')
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] Flow {flow_id} {src}->{dst} instant={inst:.3f} smoothed={prob:.3f} label={label}")
-            # If DDoS, print a clear alert
-            if result.get('prediction') == 1:
-                print(">>> ALERT: DDoS detected:", src, "->", dst, f"prob={prob:.3f}")
+        # Assumes model files are in 'model/'
+        detector = DDoSDetector()
+        logging.info("Successfully loaded model and scaler.")
+    except FileNotFoundError:
+        logging.critical("CRITICAL: Model files not found. Please create a 'model/' folder and place 'best_model.pkl' and 'scaler.pkl' inside it.")
     except Exception as e:
-        print("Error in detection_callback:", e)
-        traceback.print_exc()
+        logging.critical(f"Failed to initialize DDoSDetector: {e}")
 
-# Create TrafficCapture instance with chosen interface
-print(f"Using interface: {INTERFACE!r} (None means capture on all interfaces). If this is wrong, set env DDOS_IF or edit dashboard.py)")
-capture = TrafficCapture(interface=INTERFACE, callback=detection_callback)
 
-# --- Dash app (UI kept mostly same, timeline now shows real points) ---
-app = dash.Dash(
-    __name__,
-    external_stylesheets=[
-        dbc.themes.CYBORG,
-        'https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css'
-    ],
-    suppress_callback_exceptions=True
-)
+# --- PACKET PROCESSING FUNCTIONS ---
+
+def packet_callback(packet):
+    """Called by scapy's sniff() for every captured packet."""
+    if detector is None:
+        return
+
+    logging.debug(f"Packet captured: SRC={packet[IP].src if IP in packet else 'N/A'}, DST={packet[IP].dst if IP in packet else 'N/A'}, Summary={packet.summary()}")  # Log every packet
+
+    if IP in packet:
+        try:
+            # Extract features from the packet/flow
+            features_df, flow_id, packet_info = detector.extractor.process_packet(packet)
+            
+            if features_df is not None and not features_df.empty:
+                # Predict only if enough packets have been seen (features_df is not None)
+                result = detector.predict(features_df, flow_id, packet_info)
+                
+                if result['is_ddos']:
+                    logging.warning(f"🚨 DDoS Alert: {result['flow_id']} | Confidence: {result['confidence']:.2f}")
+
+        except Exception as e:
+            # Handle exceptions during feature extraction or prediction gracefully
+            # Note: The detector already logs non-finite value warnings internally.
+            logging.error(f"Error processing packet: {e}")
+            logging.error(traceback.format_exc())
+
+
+def start_capture(interface, bpf_filter="ip"):
+    """
+    Starts the Scapy packet capture in a dedicated thread.
+    """
+    global capture_status
+    if sniff is None:
+        logging.error("Scapy library not initialized, cannot start capture.")
+        capture_status = "Error (Scapy Missing)"
+        return
+    
+    logging.info(f"Starting packet capture on interface: {interface or 'ALL'} with filter: '{bpf_filter}'")
+    capture_status = "Running"
+    
+    try:
+        # Sniff is a blocking call. 
+        sniff(iface=interface, 
+              filter=bpf_filter, 
+              prn=packet_callback, 
+              store=0) 
+    except Exception as e:
+        logging.error(f"Scapy sniff failed. Check permissions (run as admin). Detail: {e}")
+        logging.error(traceback.format_exc())
+        capture_status = f"Error: {e.__class__.__name__}"
+
+
+def start_detection_thread():
+    """Manages the lifecycle of the packet capture thread."""
+    global capture_thread, capture_status
+    if detector is None or sniff is None:
+        capture_status = "Error (Init Failure)"
+        return
+    
+    if capture_thread is None or not capture_thread.is_alive():
+        # Daemon thread ensures the thread terminates when the main process exits
+        capture_thread = threading.Thread(target=start_capture, args=(INTERFACE,), daemon=True) 
+        capture_thread.start()
+        logging.info("Detection thread started successfully.")
+    else:
+        logging.info("Detection thread is already running.")
+
+
+# Start the detection thread immediately upon script execution if detector initialized
+if detector:
+    start_detection_thread()
+else:
+    capture_status = "Initialization Failed"
+
+# --- DASHBOARD LAYOUT AND CALLBACKS ---
+app = dash.Dash(__name__, external_stylesheets=[dbc.themes.DARKLY], title="DDoS Detection Dashboard")
+# Suppress Dash callback warnings for elements that are generated dynamically (like the table)
+app.config.suppress_callback_exceptions = True 
+
+def stat_card(id_name, title, color):
+    """Utility function for creating a statistics card."""
+    return dbc.Card(
+        dbc.CardBody([
+            html.H5(title, className="card-title"),
+            # Ensure the ID here matches the callback OUTPUT ID
+            html.P(id=id_name, className="card-text", style={'fontSize': '24px', 'color': color}), 
+        ]),
+        className="text-center m-1",
+        color="secondary", 
+        inverse=True,
+        style={"border-left": f"5px solid {color}"}
+    )
 
 app.layout = dbc.Container([
-    dbc.Row([
-        dbc.Col([
-            html.Div([
-                html.H1([html.I(className="fas fa-shield-alt me-3"), "DDoS Detection System - SOC Dashboard"],
-                        style={'color': COLORS['accent'], 'textAlign': 'center', 'fontWeight': 'bold', 'marginBottom': '10px'}),
-                html.P("Real-time Network Traffic Analysis & Threat Detection",
-                       style={'textAlign': 'center', 'color': COLORS['text'], 'opacity': '0.8'})
-            ])
-        ], width=12)
-    ], className='mb-4 mt-3'),
+    html.H1("Real-Time DDoS Monitoring System", className="text-center my-3 text-info"),
+    
+    # Interval component triggers the dashboard updates every 1 second
+    dcc.Interval(id='interval-component', interval=1*1000, n_intervals=0), 
 
     dbc.Row([
-        dbc.Col([
-            dbc.ButtonGroup([
-                dbc.Button([html.I(className="fas fa-play me-2"), "Start Capture"], id='start-btn', color='success', n_clicks=0),
-                dbc.Button([html.I(className="fas fa-stop me-2"), "Stop Capture"], id='stop-btn', color='danger', n_clicks=0),
-                dbc.Button([html.I(className="fas fa-redo me-2"), "Reset Stats"], id='reset-btn', color='warning', n_clicks=0),
-            ])
-        ], width=12, className='text-center mb-4')
-    ]),
-
-    html.Div(id='status-message', className='mb-3'),
+        # STATS CARD IDs
+        dbc.Col(stat_card('status-pps', "Packets/s (All)", "cyan"), md=3),
+        dbc.Col(stat_card('status-predictions', "Total Flow Predictions", "light"), md=3),
+        dbc.Col(stat_card('status-ddos-count', "Total DDoS Detections", "danger"), md=3),
+        dbc.Col(stat_card('status-alert', "System Status", "warning"), md=3),
+    ], className="mb-4"),
 
     dbc.Row([
-        dbc.Col([create_stat_card("Total Packets", "total-packets", "fas fa-network-wired", COLORS['accent'])], width=3),
-        dbc.Col([create_stat_card("Active Flows", "active-flows", "fas fa-stream", COLORS['warning'])], width=3),
-        dbc.Col([create_stat_card("Benign Traffic", "benign-count", "fas fa-check-circle", COLORS['success'])], width=3),
-        dbc.Col([create_stat_card("DDoS Detected", "ddos-count", "fas fa-exclamation-triangle", COLORS['danger'])], width=3),
-    ], className='mb-4'),
+        # GRAPH IDs
+        dbc.Col(dcc.Graph(id='graph-traffic-rate', config={'displayModeBar': False}), md=6), 
+        dbc.Col(dcc.Graph(id='graph-detection-timeline', config={'displayModeBar': False}), md=6), 
+    ], className="mb-4"),
 
     dbc.Row([
-        dbc.Col([create_stat_card("Detection Rate", "detection-rate", "fas fa-percentage", COLORS['warning'])], width=6),
-        dbc.Col([create_stat_card("Packets/Second", "packets-per-sec", "fas fa-tachometer-alt", COLORS['accent'])], width=6),
-    ], className='mb-4'),
+        dbc.Col(html.Div([
+            html.H4("Recent Detections", className="text-info"),
+            # TABLE ID
+            html.Div(id='table-recent-detections', className="table-responsive") 
+        ]), md=12)
+    ])
+], fluid=True)
 
-    dbc.Row([
-        dbc.Col([create_graph_card("Detection Timeline", 'detection-timeline')], width=8),
-        dbc.Col([create_graph_card("Traffic Distribution", 'traffic-distribution')], width=4),
-    ], className='mb-4'),
 
-    dbc.Row([
-        dbc.Col([create_table_card("Active Threats", 'active-threats-table')], width=6),
-        dbc.Col([create_table_card("Recent Detections", 'recent-detections-table')], width=6),
-    ], className='mb-4'),
+# --- CALLBACKS ---
 
-    dbc.Row([
-        dbc.Col([create_table_card("Recent Network Packets", 'recent-packets-table')], width=12),
-    ], className='mb-4'),
-
-    dcc.Interval(id='interval-component', interval=1000, n_intervals=0),
-
-], fluid=True, style={'backgroundColor': COLORS['background'], 'minHeight': '100vh', 'padding': '20px'})
-
-# --- Callbacks (control capture) ---
+# Callback 1: Updates status cards
 @app.callback(
-    Output('status-message', 'children'),
-    [Input('start-btn', 'n_clicks'), Input('stop-btn', 'n_clicks'), Input('reset-btn', 'n_clicks')],
-    prevent_initial_call=True
-)
-def control_capture(start, stop, reset):
-    ctx = dash.callback_context
-    if not ctx.triggered:
-        return ""
-    button_id = ctx.triggered[0]['prop_id'].split('.')[0]
-
-    if button_id == 'start-btn':
-        if not capture.running:
-            try:
-                capture.start()
-                return dbc.Alert("Capture started!", color="success", duration=3000)
-            except Exception as e:
-                print("Failed to start capture:", e)
-                traceback.print_exc()
-                return dbc.Alert(f"Failed to start capture: {e}", color="danger", duration=5000)
-    elif button_id == 'stop-btn':
-        if capture.running:
-            capture.stop()
-            return dbc.Alert("Capture stopped!", color="info", duration=3000)
-    elif button_id == 'reset-btn':
-        detector.reset_stats()
-        return dbc.Alert("Statistics reset!", color="info", duration=3000)
-    return ""
-
-# --- Stats updater ---
-@app.callback(
-    [Output('total-packets', 'children'), Output('active-flows', 'children'), Output('benign-count', 'children'),
-     Output('ddos-count', 'children'), Output('detection-rate', 'children'), Output('packets-per-sec', 'children')],
+    [
+        Output('status-pps', 'children'),
+        Output('status-predictions', 'children'),
+        Output('status-ddos-count', 'children'),
+        Output('status-alert', 'children'),
+        Output('status-alert', 'style'),
+    ],
     [Input('interval-component', 'n_intervals')]
 )
 def update_stats(n):
-    try:
-        c_stats = capture.get_stats()
-        d_stats = detector.get_stats()
-        return f"{c_stats['total_packets']:,}", f"{c_stats['total_flows']:,}", f"{d_stats['benign_count']:,}", f"{d_stats['ddos_count']:,}", f"{d_stats['detection_rate']*100:.1f}%", f"{c_stats.get('packets_per_second', 0):,}"
-    except Exception as e:
-        print("Error in update_stats:", e)
-        return "0", "0", "0", "0", "0%", "0"
+    """Updates the status cards with the latest detector stats."""
+    if detector is None:
+        # If detector initialization failed
+        return "N/A", "N/A", "N/A", capture_status, {'fontSize': '24px', 'color': 'red', 'fontWeight': 'bold'}
+        
+    stats = detector.get_stats()
+    
+    pps = f"{stats['packets_per_second']:.2f}"
+    predictions = stats['total_predictions']
+    ddos_count = stats['ddos_count']
+    
+    # Logic for overall alert status
+    alert_rate_threshold_high = 0.5 
+    alert_rate_threshold_elevated = 0.1
 
-# --- Timeline plot (shows instant & smoothed probabilities over time) ---
-@app.callback(Output('detection-timeline', 'figure'), [Input('interval-component', 'n_intervals')])
-def update_timeline(n):
-    try:
-        timeline_data = detector.get_timeline_data(minutes=10)
-        if not timeline_data:
-            return create_empty_figure("Waiting for data...")
+    timeline_data = detector.get_timeline_data()
+    current_ddos_rate = 0
+    if timeline_data and 'rate' in timeline_data[-1]:
+        current_ddos_rate = timeline_data[-1]['rate']
+    
+    # Determine alert status
+    if current_ddos_rate > alert_rate_threshold_high:
+        alert_status = "⚠️ HIGH THREAT"
+        status_color = 'red'
+    elif current_ddos_rate > alert_rate_threshold_elevated:
+        alert_status = "🟠 ELEVATED"
+        status_color = 'orange'
+    else:
+        alert_status = "🟢 NORMAL"
+        status_color = 'green'
+        
+    status_style = {'fontSize': '24px', 'color': status_color, 'fontWeight': 'bold'}
+    
+    logging.debug(f"Stats update: PPS={pps}, Predictions={predictions}, DDoS={ddos_count}, Status={alert_status}")  # Added debug
+    return pps, predictions, ddos_count, alert_status, status_style
 
-        # Build scatter points
-        times = [datetime.fromisoformat(d['timestamp']) for d in timeline_data]
-        probs = [d['probability'] for d in timeline_data]
-        labels = [d['type'] for d in timeline_data]
+# Callback 2: Updates Traffic Rate Graph
+@app.callback(
+    Output('graph-traffic-rate', 'figure'),
+    [Input('interval-component', 'n_intervals')]
+)
+def update_traffic_graph(n):
+    """Updates the traffic rate graph."""
+    if detector is None:
+        return go.Figure()
+        
+    timeline_data = detector.get_timeline_data()
+    # Limit data for performance and clarity
+    data_points = timeline_data[-300:] 
+    
+    times = [datetime.fromtimestamp(d['time']) for d in data_points]
+    pps_data = [d['total_pps'] for d in data_points]
+    
+    fig = go.Figure(data=[
+        go.Scatter(x=times, y=pps_data, mode='lines', line=dict(color='cyan'), name='Total PPS', fill='tozeroy')
+    ])
+    
+    fig.update_layout(
+        title='Live Packet Traffic Rate (Packets/s)',
+        xaxis_title='Time',
+        yaxis_title='Packets/s',
+        template='plotly_dark',
+        height=350,
+        margin={'t': 50, 'b': 30, 'l': 50, 'r': 10}
+    )
+    return fig
 
-        df_points = {
-            'time': times,
-            'prob': probs,
-            'label': labels
-        }
+# Callback 3: Updates Detection Timeline Graph
+@app.callback(
+    Output('graph-detection-timeline', 'figure'),
+    [Input('interval-component', 'n_intervals')]
+)
+def update_detection_graph(n):
+    """Updates the DDoS detection rate graph."""
+    if detector is None:
+        return go.Figure()
+        
+    timeline_data = detector.get_timeline_data()
+    data_points = timeline_data[-300:] 
 
-        fig = go.Figure()
-        # Scatter for benign
-        fig.add_trace(go.Scatter(
-            x=[t for t, l in zip(times, labels) if l == 'Benign'],
-            y=[p for p, l in zip(probs, labels) if l == 'Benign'],
-            mode='markers+lines',
-            name='Benign',
-            marker=dict(size=6),
-            line=dict(width=1),
-        ))
-        # Scatter for ddos
-        fig.add_trace(go.Scatter(
-            x=[t for t, l in zip(times, labels) if l == 'DDoS'],
-            y=[p for p, l in zip(probs, labels) if l == 'DDoS'],
-            mode='markers+lines',
-            name='DDoS',
-            marker=dict(size=8),
-            line=dict(width=1),
-        ))
+    times = [datetime.fromtimestamp(d['time']) for d in data_points]
+    ddos_rate = [d['rate'] for d in data_points]
+    
+    fig = go.Figure(data=[
+        go.Bar(x=times, y=ddos_rate, marker=dict(color='red'), name='DDoS Rate (Events/s)')
+    ])
+    
+    fig.update_layout(
+        title='DDoS Detection Rate',
+        xaxis_title='Time',
+        yaxis_title='DDoS Events per Second',
+        template='plotly_dark',
+        height=350,
+        margin={'t': 50, 'b': 30, 'l': 50, 'r': 10}
+    )
+    return fig
 
-        fig.update_layout(template='plotly_dark', paper_bgcolor=COLORS['card_bg'], plot_bgcolor=COLORS['card_bg'],
-                          margin=dict(l=40, r=40, t=40, b=40),
-                          yaxis=dict(range=[0, 1], title='Probability'),
-                          xaxis=dict(title='Time'))
-        return fig
-    except Exception as e:
-        print("Error building timeline:", e)
-        traceback.print_exc()
-        return create_empty_figure("Error building timeline")
-
-@app.callback(Output('traffic-distribution', 'figure'), [Input('interval-component', 'n_intervals')])
-def update_distribution(n):
-    try:
-        stats = detector.get_stats()
-        if stats['benign_count'] == 0 and stats['ddos_count'] == 0:
-            return create_empty_figure("No data")
-        fig = go.Figure(data=[
-            go.Pie(labels=['Benign', 'DDoS'], values=[stats['benign_count'], stats['ddos_count']],
-                   marker=dict(colors=[COLORS['benign'], COLORS['ddos']]), hole=0.4)
-        ])
-        fig.update_layout(template='plotly_dark', paper_bgcolor=COLORS['card_bg'], plot_bgcolor=COLORS['card_bg'],
-                          margin=dict(l=20, r=20, t=20, b=20))
-        return fig
-    except Exception as e:
-        print("Error in update_distribution:", e)
-        return create_empty_figure("Error")
-
-@app.callback(Output('active-threats-table', 'children'), [Input('interval-component', 'n_intervals')])
-def update_threats_table(n):
-    threats = detector.get_active_threats()
-    if not threats:
-        return html.P("No threats", style={'textAlign': 'center', 'color': COLORS['success']})
-
-    table_header = [html.Thead(html.Tr([html.Th("Source IP"), html.Th("Count"), html.Th("Probability"), html.Th("Severity")]))]
-    rows = [html.Tr([html.Td(t['src_ip']), html.Td(t['count']), html.Td(f"{t['max_probability']*100:.1f}%"), html.Td(t['severity'].upper())]) for t in threats[:10]]
-
-    return dbc.Table(table_header + [html.Tbody(rows)], bordered=True, color='dark', hover=True, responsive=True, striped=True, style={'fontSize': '0.9rem'})
-
-@app.callback(Output('recent-detections-table', 'children'), [Input('interval-component', 'n_intervals')])
+# Callback 4: Updates Recent Detections Table
+@app.callback(
+    Output('table-recent-detections', 'children'),
+    [Input('interval-component', 'n_intervals')]
+)
 def update_detections_table(n):
-    detections = detector.get_recent_detections(50)
-    if not detections:
-        return html.P("No detections yet")
+    """Updates the table of recent detections."""
+    if detector is None:
+        return dbc.Alert(f"Detector failed to initialize. Current status: {capture_status}. Check console for error messages.", color="danger")
 
-    table_header = [html.Thead(html.Tr([html.Th("Time"), html.Th("Type"), html.Th("Probability"), html.Th("Source")]))]
-    rows = [html.Tr([html.Td(datetime.fromisoformat(d['timestamp']).strftime('%H:%M:%S')), html.Td(d['prediction_label']), html.Td(f"{d['probability']*100:.1f}%"), html.Td(d['src_ip'])]) for d in reversed(detections)]
+    recent_detections = detector.get_recent_detections(n=10)
+    
+    if not recent_detections:
+        return dbc.Alert("No detections yet. Monitoring traffic...", color="secondary")
+        
+    table_header = [
+        html.Thead(html.Tr([
+            html.Th("Time"), html.Th("Source IP"), html.Th("Flow ID"), html.Th("Status"), html.Th("Confidence")
+        ]))
+    ]
+    
+    rows = []
+    for d in recent_detections:
+        is_ddos_text = "🚨 DDoS" if d['is_ddos'] else "✅ Benign"
+        color = 'red' if d['is_ddos'] else 'green'
+        
+        rows.append(html.Tr([
+            html.Td(datetime.fromtimestamp(d['time']).strftime('%H:%M:%S')),
+            html.Td(d['src_ip']),
+            html.Td(d['flow_id']),
+            html.Td(is_ddos_text, style={'color': color, 'fontWeight': 'bold'}),
+            html.Td(f"{d['confidence']:.4f}"),
+        ]))
 
-    return dbc.Table(table_header + [html.Tbody(rows)], bordered=True, color='dark', hover=True, responsive=True, striped=True, style={'fontSize': '0.9rem'})
+    table_body = [html.Tbody(rows)]
+    
+    # FIX APPLIED HERE: Replaced 'dark=True' with 'color="dark"'
+    return dbc.Table(table_header + table_body, striped=True, bordered=True, hover=True, color='dark')
 
-@app.callback(Output('recent-packets-table', 'children'), [Input('interval-component', 'n_intervals')])
-def update_packets_table(n):
-    packets = capture.get_recent_packets(15)
-    if not packets:
-        return html.P("No packets captured")
 
-    table_header = [html.Thead(html.Tr([html.Th("Time"), html.Th("Src"), html.Th("Dst"), html.Th("Prot"), html.Th("Len")]))]
-    rows = [html.Tr([html.Td(datetime.fromisoformat(p['timestamp']).strftime('%H:%M:%S')), html.Td(p['src_ip']), html.Td(p['dst_ip']), html.Td(p['protocol']), html.Td(f"{p['length']}B")]) for p in reversed(packets)]
-
-    return dbc.Table(table_header + [html.Tbody(rows)], bordered=True, color='dark', hover=True, responsive=True, striped=True, style={'fontSize': '0.9rem'})
-
-# Run server
 if __name__ == '__main__':
-    print("Starting Dashboard on http://127.0.0.1:8050")
-    app.run(debug=False, host='0.0.0.0', port=8050)
+    if detector is None:
+         logging.critical("Dashboard startup failed. Please resolve model/scaler path or import issues.")
+    else:
+        try:
+            logging.info("Dashboard starting. Access at http://127.0.0.1:8050/")
+            app.run(debug=False, host='0.0.0.0') 
+        except Exception as e:
+            logging.error(f"Failed to run Dash server: {e}")

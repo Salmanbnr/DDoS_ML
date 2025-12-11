@@ -1,5 +1,3 @@
-# docker_ddos_attacker.py 
-
 import socket
 import threading
 import time
@@ -19,7 +17,7 @@ class RealisticDDoSAttacker:
     Generates DDoS traffic patterns that match real-world training data.
     """
     
-    def __init__(self, target_ip, target_port=80):
+    def __init__(self, target_ip, target_port=80):  # Changed default port to 80
         self.target_ip = target_ip
         self.target_port = target_port
         self.running = False
@@ -52,7 +50,7 @@ class RealisticDDoSAttacker:
         elif intensity == 'medium':
             num_threads = 200
         else:  # high
-            num_threads = 500  # Dramatically increased thread count to force high flow volume
+            num_threads = 1000  # Increased to 1000 for more flows/packets
             
         def worker():
             while self.running and (time.time() - self.stats['start_time']) < duration:
@@ -293,7 +291,7 @@ class RealisticDDoSAttacker:
 def main():
     parser = argparse.ArgumentParser(description='Docker DDoS Attack Simulator')
     parser.add_argument('--target', required=True, help='Target IP')
-    parser.add_argument('--port', type=int, default=8050, help='Target Port')
+    parser.add_argument('--port', type=int, default=80, help='Target Port')  # Changed default to 80
     parser.add_argument('--type', choices=['syn', 'http', 'udp', 'slowloris', 'dataset_mimic'], default='dataset_mimic', help='Attack Type')
     parser.add_argument('--duration', type=int, default=120, help='Duration (s)')
     parser.add_argument('--intensity', choices=['low', 'medium', 'high'], default='medium', help='Intensity')

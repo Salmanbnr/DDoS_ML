@@ -1,255 +1,208 @@
-#ddos_detector.py
 import joblib
 import pandas as pd
 import numpy as np
 from datetime import datetime
-from collections import deque, defaultdict
 import threading
+import time
+import os
+import logging
+from collections import deque
+from flow_extractor import FlowExtractor 
 
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 class DDoSDetector:
-    """Real-time DDoS detection using trained ML model - FIXED VERSION"""
+    def __init__(self, model_path='model/best_model.pkl', scaler_path='model/scaler.pkl', alert_threshold=0.5):  # Lowered threshold to 0.5
+        self.model = None
+        self.scaler = None
+        self.alert_threshold = alert_threshold
+        self.lock = threading.Lock()
+        
+        self._load_models(model_path, scaler_path)
 
-    def __init__(self,
-                 model_path='model/best_model.pkl',
-                 scaler_path='model/scaler.pkl',
-                 alert_threshold=0.65,          # **REDUCED** from 0.85 to 0.65 for better detection
-                 smoothing_window=2,            # **REDUCED** from 3 to 2
-                 min_history_for_detection=1    # **REDUCED** from 2 to 1 for faster response
-                 ):
-        print("Loading ML model and scaler...")
+        self.extractor = FlowExtractor() 
+        self.stats = self._create_initial_stats()
+        
+        # Optimized deques for history and rate calculation
+        self.detection_history = deque(maxlen=3000) 
+        self.recent_ddos_times = deque()           
+        
+        self.threat_timeline = deque(maxlen=60 * 60) 
+        self.last_stats_update = time.time()
+        
+        self.running = True
+        self.stats_thread = threading.Thread(target=self._stats_update_loop, daemon=True)
+        self.stats_thread.start()
+
+    def _create_initial_stats(self):
+        return {
+            'total_packets': 0,
+            'total_flows': 0,
+            'packets_per_second': 0.0,
+            'total_predictions': 0,
+            'ddos_count': 0,
+            'benign_count': 0,
+            'alert_status': 'OK',
+            'last_ddos_time': None
+        }
+
+    def _load_models(self, model_path, scaler_path):
+        """Loads the pre-trained ML model and StandardScaler."""
+        if not os.path.exists(model_path) or not os.path.exists(scaler_path):
+            logging.error(f"Required model or scaler file missing. Please ensure 'model/best_model.pkl' and 'model/scaler.pkl' exist.")
+            raise FileNotFoundError("Missing model or scaler files. Cannot initialize detector.")
+            
         try:
             self.model = joblib.load(model_path)
             self.scaler = joblib.load(scaler_path)
-            print("✓ Model and scaler loaded successfully")
-            print(f"✓ Alert threshold set to: {alert_threshold}")
+            logging.info(f"Successfully loaded model and scaler.")
         except Exception as e:
-            print(f"❌ Error loading model or scaler: {e}")
+            logging.error(f"Error loading models: {e}")
             raise
 
-        # Detection history (store results)
-        self.detections = deque(maxlen=2000)
-        self.lock = threading.Lock()
-
-        # Statistics
-        self.stats = {
-            'total_predictions': 0,
-            'benign_count': 0,
-            'ddos_count': 0,
-            'detection_rate': 0.0,
-            'last_detection': None,
-            'active_threats': []
-        }
-
-        # Thresholds and smoothing parameters
-        self.alert_threshold = alert_threshold
-        self.smoothing_window = max(1, smoothing_window)
-        self.min_history_for_detection = max(1, min_history_for_detection)
-
-        # Keep per-source and per-destination recent probability history
-        self.prob_history_src = defaultdict(lambda: deque(maxlen=self.smoothing_window))
-        self.prob_history_dst = defaultdict(lambda: deque(maxlen=self.smoothing_window))
-
-    def _safe_dataframe(self, features_df):
-        """Ensure numeric and no inf/nans"""
-        df = features_df.copy()
-        df = df.replace([np.inf, -np.inf], 0)
-        df = df.fillna(0)
-        for c in df.columns:
-            if not np.issubdtype(df[c].dtype, np.number):
-                try:
-                    df[c] = pd.to_numeric(df[c], errors='coerce').fillna(0)
-                except:
-                    df[c] = 0
-        return df
-
     def predict(self, features_df, flow_id, packet_info):
-        """Make ML prediction with improved detection"""
-        try:
-            if features_df is None or features_df.empty:
-                return None
-
-            df_clean = self._safe_dataframe(features_df)
-
-            # Scale features
-            try:
-                features_scaled = self.scaler.transform(df_clean)
-            except Exception as e:
-                print(f"⚠ Scaler transform error: {e}")
-                return None
-
-            # Get ML model probabilities
-            try:
-                probs = self.model.predict_proba(features_scaled)[0]
-            except Exception as e:
-                print(f"⚠ Model predict_proba error: {e}")
-                return None
-
-            ddos_prob = float(probs[1])  # Probability for DDoS class
-
-            src_ip = packet_info.get('src_ip', 'unknown_src')
-            dst_ip = packet_info.get('dst_ip', 'unknown_dst')
-
-            # Update history
-            with self.lock:
-                self.prob_history_src[src_ip].append(ddos_prob)
-                self.prob_history_dst[dst_ip].append(ddos_prob)
-
-                # **FIXED**: Use average for smoothing, with fallback
-                if len(self.prob_history_src[src_ip]) >= self.min_history_for_detection:
-                    avg_src = float(np.mean(self.prob_history_src[src_ip]))
-                else:
-                    avg_src = None
-
-                if len(self.prob_history_dst[dst_ip]) >= self.min_history_for_detection:
-                    avg_dst = float(np.mean(self.prob_history_dst[dst_ip]))
-                else:
-                    avg_dst = None
-
-            # **FIXED**: Better probability calculation
-            if avg_src is not None and avg_dst is not None:
-                # If we have both, use the maximum (more aggressive)
-                final_prob = max(avg_src, avg_dst)
-            elif avg_src is not None:
-                final_prob = avg_src
-            elif avg_dst is not None:
-                final_prob = avg_dst
-            else:
-                # Not enough history - use instant probability with slight penalty
-                final_prob = ddos_prob * 0.9  # Only 10% penalty instead of 50%
-
-            final_prediction = 1 if final_prob >= self.alert_threshold else 0
-
-            # **IMPROVED**: Better logging with emojis
-            status_emoji = "🚨" if final_prediction == 1 else "✅"
-            print(f"{status_emoji} Flow {flow_id[:20]}... | instant={ddos_prob:.3f} | smoothed={final_prob:.3f} | {'⚠️ DDoS DETECTED' if final_prediction else 'Benign'}")
-
-            # Build result
-            result = {
-                'timestamp': datetime.now().isoformat(),
-                'flow_id': flow_id,
-                'prediction': final_prediction,
-                'prediction_label': 'DDoS' if final_prediction == 1 else 'Benign',
-                'probability': final_prob,
-                'instant_probability': ddos_prob,
-                'src_ip': src_ip,
-                'dst_ip': dst_ip,
-                'dst_port': packet_info.get('dst_port', 0),
-                'packet_info': packet_info,
-                'severity': self._calculate_severity(final_prob)
-            }
-
-            # Update stored detections and stats
-            with self.lock:
-                self.detections.append(result)
-                self.stats['total_predictions'] += 1
-
-                if final_prediction == 1:
-                    self.stats['ddos_count'] += 1
-                    self.stats['last_detection'] = result
-                    self._add_active_threat(result)
-                    
-                    # **NEW**: Alert on detection
-                    print(f"\n{'='*60}")
-                    print(f"🚨 DDoS ATTACK DETECTED!")
-                    print(f"   Source: {src_ip}")
-                    print(f"   Destination: {dst_ip}:{packet_info.get('dst_port', 0)}")
-                    print(f"   Confidence: {final_prob:.1%}")
-                    print(f"   Severity: {result['severity'].upper()}")
-                    print(f"{'='*60}\n")
-                else:
-                    self.stats['benign_count'] += 1
-
-                if self.stats['total_predictions'] > 0:
-                    self.stats['detection_rate'] = (self.stats['ddos_count'] / self.stats['total_predictions'])
-
-            return result
-
-        except Exception as e:
-            print(f"❌ Error in prediction: {e}")
-            import traceback
-            traceback.print_exc()
-            return None
-
-    def _calculate_severity(self, probability):
-        if probability < 0.5:
-            return 'low'
-        elif probability < 0.7:
-            return 'medium'
-        elif probability < 0.85:
-            return 'high'
-        else:
-            return 'critical'
-
-    def _add_active_threat(self, result):
-        src_ip = result['src_ip']
-        threat_exists = False
-
-        for threat in self.stats['active_threats']:
-            if threat['src_ip'] == src_ip:
-                threat['count'] += 1
-                threat['last_seen'] = result['timestamp']
-                threat['max_probability'] = max(threat['max_probability'], result['probability'])
-                threat_exists = True
-                break
-
-        if not threat_exists:
-            self.stats['active_threats'].append({
-                'src_ip': src_ip,
-                'dst_ip': result['dst_ip'],
-                'flow_id': result['flow_id'],
-                'first_seen': result['timestamp'],
-                'last_seen': result['timestamp'],
-                'count': 1,
-                'max_probability': result['probability'],
-                'severity': result['severity']
-            })
-
-        # Keep recent threats within 5 minutes
-        cutoff_seconds = 300
-        self.stats['active_threats'] = [
-            t for t in self.stats['active_threats']
-            if (datetime.now() - datetime.fromisoformat(t['last_seen'])).total_seconds() < cutoff_seconds
-        ]
-
-    # ----- Helper methods -----
-    def get_recent_detections(self, n=20):
+        """Scales input features and uses the loaded model to predict the class."""
         with self.lock:
-            return list(self.detections)[-n:]
+            try:
+                # Added logging: Print key features for debugging
+                logging.info(f"Features for flow {flow_id}: Destination Port={features_df.get(' Destination Port', 'N/A')}, Flow Duration={features_df.get(' Flow Duration', 'N/A')}, Total Fwd Packets={features_df.get(' Total Fwd Packets', 'N/A')}, Total Backward Packets={features_df.get(' Total Backward Packets', 'N/A')}, Fwd Packet Length Mean={features_df.get(' Fwd Packet Length Mean', 'N/A')}, Flow Bytes/s={features_df.get(' Flow Bytes/s', 'N/A')}, Flow Packets/s={features_df.get(' Flow Packets/s', 'N/A')}")
+
+                # 1. Prepare data for model: ensure float64 and check non-finite values
+                
+                # Check for infinite/NaN values using the DataFrame's underlying NumPy array
+                if not np.all(np.isfinite(features_df.values)):
+                     logging.warning(f"Flow {flow_id} contains non-finite values. Skipping prediction.")
+                     return {'is_ddos': False, 'confidence': 0.0, 'flow_id': flow_id, 'reason': 'Non-finite features'}
+
+                # FIX FOR WARNING: Pass the DataFrame directly to the scaler. 
+                # The scaler recognizes the feature names, suppressing the warning.
+                X_scaled = self.scaler.transform(features_df.astype(np.float64))
+                
+                # 2. Get prediction (0=Benign, 1=DDoS)
+                prediction = self.model.predict(X_scaled)[0]
+                
+                # 3. Get confidence (probability of DDoS)
+                if hasattr(self.model, 'predict_proba'):
+                    # The model expects X_scaled to be an array, which it is.
+                    confidence = self.model.predict_proba(X_scaled)[0][1] 
+                else:
+                    confidence = 1.0 if prediction == 1 else 0.0
+
+                is_ddos = (prediction == 1) or (confidence >= self.alert_threshold)
+
+                # Added logging: Always log prediction result
+                logging.info(f"Prediction for flow {flow_id}: is_ddos={is_ddos}, prediction_class={prediction}, confidence (prob DDoS)={confidence:.4f}")
+
+                # 4. Update stats (Lock is held by this function)
+                self._update_stats(is_ddos, confidence, flow_id, packet_info)
+                
+                return {
+                    'is_ddos': is_ddos,
+                    'prediction': int(prediction),
+                    'confidence': float(confidence),
+                    'flow_id': flow_id,
+                    'timestamp': datetime.now().isoformat()
+                }
+
+            except ValueError as e:
+                logging.warning(f"Prediction failed for flow {flow_id}: Feature mismatch or ValueError: {e}.")
+                return {'is_ddos': False, 'confidence': 0.0, 'flow_id': flow_id, 'reason': f'Feature mismatch: {e}'}
+            except Exception as e:
+                logging.error(f"Prediction failed for flow {flow_id}: General Error: {e}")
+                return {'is_ddos': False, 'confidence': 0.0, 'flow_id': flow_id, 'reason': f'General Error: {e}'}
+
+    # === Statistical Update Methods ===
+    def _update_stats(self, is_ddos, confidence, flow_id, packet_info):
+        """Internal method to update statistics based on a single prediction. Assumes lock is held by caller."""
+        current_time = time.time()
+        
+        self.stats['total_predictions'] += 1
+        
+        if is_ddos:
+            self.stats['ddos_count'] += 1
+            self.stats['last_ddos_time'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            # Optimization: Add time to the dedicated DDoS rate deque
+            self.recent_ddos_times.append(current_time)
+        else:
+            self.stats['benign_count'] += 1
+        
+        self.detection_history.append({
+            'time': current_time,
+            'is_ddos': is_ddos,
+            'confidence': confidence,
+            'src_ip': packet_info.get('src_ip', 'N/A'),
+            'dst_ip': packet_info.get('dst_ip', 'N/A'),
+            'flow_id': flow_id,
+            'size': packet_info.get('size', 0)
+        })
+
+    def _stats_update_loop(self):
+        """Threaded loop to update time-based stats."""
+        while self.running:
+            time.sleep(1) 
+            self.extractor.cleanup_old_flows()
+            self._update_time_based_stats()
+
+    def _update_time_based_stats(self):
+        """Calculate packets per second and update overall alert status."""
+        current_time = time.time()
+        time_diff = current_time - self.last_stats_update
+        
+        current_packets = self.extractor.get_total_packets_seen()
+        
+        with self.lock:
+            if time_diff > 0:
+                packets_since_last_update = current_packets - self.stats['total_packets']
+                self.stats['packets_per_second'] = packets_since_last_update / time_diff
+                self.stats['total_packets'] = current_packets
+                self.stats['total_flows'] = len(self.extractor.flows)
+            
+            self.last_stats_update = current_time
+            
+            # Simplified Alert Status based on PPS
+            if self.stats['packets_per_second'] > 500:
+                self.stats['alert_status'] = 'HIGH TRAFFIC'
+            elif self.stats['packets_per_second'] > 100:
+                self.stats['alert_status'] = 'ELEVATED'
+            else:
+                self.stats['alert_status'] = 'OK'
+
+            # Optimized DDoS Rate Calculation
+            ddos_rate_window = 10 
+            
+            # Remove timestamps older than the window from the front of the deque (O(1) amortized)
+            while self.recent_ddos_times and self.recent_ddos_times[0] < current_time - ddos_rate_window:
+                self.recent_ddos_times.popleft()
+                
+            ddos_rate = len(self.recent_ddos_times) / ddos_rate_window
+            
+            self.threat_timeline.append({
+                'time': current_time, 
+                'rate': ddos_rate,
+                'total_pps': self.stats['packets_per_second']
+            })
+            
+            if self.stats['total_predictions'] > 0 and self.stats['total_predictions'] % 5 == 0:
+                logging.info(f"📊 PPS: {self.stats['packets_per_second']:.2f}, DDoS Rate (10s): {ddos_rate:.2f}, Total Detections: {self.stats['total_predictions']}, DDoS: {self.stats['ddos_count']}, Alert: {self.stats['alert_status']}")
+
 
     def get_stats(self):
+        """Get current statistics (Used by dashboard)."""
         with self.lock:
             return self.stats.copy()
 
-    def get_active_threats(self):
+    def get_recent_detections(self, n=20):
+        """Get the most recent N detection records (Used by dashboard)."""
         with self.lock:
-            return self.stats['active_threats'].copy()
+            return list(reversed(list(self.detection_history)))[:n]
+            
+    def get_timeline_data(self):
+        """Get timeline data for plotting (Used by dashboard)."""
+        with self.lock:
+            return list(self.threat_timeline)
 
-    def get_timeline_data(self, minutes=10):
-        with self.lock:
-            cutoff = datetime.now().timestamp() - (minutes * 60)
-            timeline = []
-            for d in self.detections:
-                ts = datetime.fromisoformat(d['timestamp']).timestamp()
-                if ts >= cutoff:
-                    timeline.append({
-                        'timestamp': d['timestamp'],
-                        'type': d['prediction_label'],
-                        'probability': d['probability']
-                    })
-            return timeline
-
-    def reset_stats(self):
-        with self.lock:
-            self.stats = {
-                'total_predictions': 0,
-                'benign_count': 0,
-                'ddos_count': 0,
-                'detection_rate': 0.0,
-                'last_detection': None,
-                'active_threats': []
-            }
-            self.detections.clear()
-            self.prob_history_src.clear()
-            self.prob_history_dst.clear()
-            print("✓ Statistics reset")
+    def stop(self):
+        """Cleanly stop the internal threads."""
+        self.running = False
+        self.stats_thread.join()
+        logging.info("DDoSDetector stopped.")
